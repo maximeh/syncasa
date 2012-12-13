@@ -1,0 +1,322 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+import gdata.photos as gp
+from gdata.service import BadAuthentication
+from gdata.photos import service
+from gdata.photos.service import GooglePhotosException
+from atom.http import ProxyError
+
+import pyinotify as p
+from pyinotify import WatchManager, Notifier, ProcessEvent
+
+import logging
+import mimetypes
+import os
+import sys
+
+class Syncasa(ProcessEvent):
+
+    def __init__(self, path):
+        ProcessEvent.__init__(self)
+        # Object needed for pyinotify
+        self.wm = WatchManager()
+        mask = p.IN_CREATE | p.IN_CLOSE_WRITE | p.IN_DELETE | p.IN_DELETE_SELF
+        mask |= p.IN_MOVED_TO | p.IN_MOVED_FROM | p.IN_MOVE_SELF
+        self.wdd = self.wm.add_watch(path, mask,
+            rec=True, auto_add=True)
+
+        # Thread to treat the queue of event
+        self.notifier = Notifier(self.wm, self)
+        self.g_client = None
+        self.path = path
+        self.albums = {}
+
+    def start(self):
+        # Delete album online but not locally
+        o_albums = self.g_client.GetUserFeed()
+        for o_album in o_albums.entry:
+            o_album_path = os.path.join(self.path, o_album.title.text)
+            if not os.path.exists(o_album_path):
+                logging.debug("%s does not exist locally, deleting.." % o_album_path)
+                self.g_client.Delete(o_album)
+
+        # Create a dict of albums from the albums in the local folder
+        for album in os.listdir(self.path):
+            a_path = os.path.join(self.path, album)
+            if not os.path.isdir(a_path) or album[0] == '.':
+                continue
+            self.albums[album] = Album(self.g_client, a_path)
+
+        # Loop forever and handle events.
+        # It seems the CTR+C event in taken care of by pyinotify
+        self.notifier.loop()
+
+    def login(self, user, pwd):
+        # log into the service
+        self.g_client = service.PhotosService()
+        self.g_client.email = user
+        self.g_client.password = pwd
+        self.g_client.source = 'syncasa'
+        try:
+            self.g_client.ProgrammaticLogin()
+        except (BadAuthentication, ProxyError) as err:
+            logging.error("Error while authenticating : %s", err)
+            return False
+        return True
+
+    def process_IN_CREATE(self, event):
+        if event.dir:
+            # Create the album online
+            self.albums[event.name] = Album(self.g_client, event.pathname)
+        return
+
+    def process_IN_CLOSE_WRITE(self, event):
+        if event.dir:
+            # We are not interested in theses events
+            return
+        # Create photo when created picture (in any way)
+        album = event.path.split('/')[-1]
+        self.albums[album].photos[event.name] = Photo(self.albums[album],
+                event.pathname)
+
+    def process_IN_DELETE(self, event):
+        if event.dir:
+            return
+        album = event.path.split('/')[-1]
+        self.albums[album].photos[event.name].delete()
+        del self.albums[album].photos[event.name]
+
+    def process_IN_DELETE_SELF(self, event):
+        if not event.dir:
+            return
+        self.albums[event.name].delete()
+        del self.albums[event.name]
+        watch_id = self.wm.get_wd(event.path)
+        self.wm.rm_watch(watch_id)
+
+    def process_IN_MOVED_TO(self, event):
+        if not hasattr(event, 'src_pathname'):
+            # File from a non watched directory to a watched one.
+            # Treat it as a create
+            if event.dir:
+                self.process_IN_CREATE(event)
+            else:
+                self.process_IN_CLOSE_WRITE(event)
+            return
+        old_name = event.src_pathname.split('/')[-1]
+        logging.debug("Rename %s -> %s" % (old_name, event.name))
+        if event.dir:
+            self.albums[old_name].rename(event.name)
+            self.albums[event.name] = self.albums.pop(old_name)
+            return
+        album = event.path.split('/')[-1]
+        self.albums[album].photos[old_name].rename(event.name)
+        self.albums[album].photos[event.name] = self.albums[album].photos.pop(old_name)
+
+    def process_IN_MOVE_SELF(self, event):
+        # Moving from a watched directory to somewhere externals
+        # Treat as a delete
+        if "-unknown-path" in event.path:
+            tmp_path = event.path.split('-unknown-path')[0]
+            event.name = tmp_path.split('/')[-1]
+            if event.dir:
+                self.process_IN_DELETE_SELF(event)
+            else:
+                evet.path = tmp_path
+                self.process_IN_DELETE(event)
+
+class Album():
+
+    def __init__(self, picasa, path):
+        self.name = os.path.basename(path)
+        self.path = path
+        self.picasa = picasa
+        # Do we exists online ?
+        logging.debug("Search %s online..." % self.name)
+        self.g_obj = self.is_online()
+        if self.g_obj is None:
+            logging.debug("Creating album %s online." % self.name)
+            self.g_obj = self.picasa.InsertAlbum(title=self.name,
+                summary="Sync of %s folder" % self.name, access='private')
+
+        self.url = '/data/feed/api/user/%s/albumid/%s' % (
+                        "default", self.g_obj.gphoto_id.text)
+
+        # Delete the picture online but not present locally
+        o_photos = self.picasa.GetFeed("%s?kind=photo" % self.url)
+        for o_photo in o_photos.entry:
+            o_photo_path = os.path.join(path, o_photo.title.text)
+            if not os.path.exists(o_photo_path):
+                logging.debug("%s does not exist locally, deleting.." % o_photo_path)
+                self.picasa.Delete(o_photo)
+
+        self.photos = {}
+        for photo in os.listdir(path):
+            file_path = os.path.join(path, photo)
+            logging.debug("Adding %s with name %s." % (file_path, photo))
+            # Avoid directory and hidden file
+            if not os.path.isfile(file_path) or photo[0] == '.':
+                continue
+
+            # Check that it's an image
+            file_mime_type = mimetypes.guess_type(photo)
+            if file_mime_type[0] is None \
+                or not file_mime_type[0].startswith("image/"):
+                continue
+            self.photos[photo] = Photo(self, file_path)
+
+    def update(self):
+        # Update the g_obj
+        self.g_obj = self.is_online()
+        if self.g_obj is None:
+            logging.error("Album not online.")
+
+    def is_online(self):
+        # check if the albums exists online
+        # return the obj or None
+        albums_list = self.picasa.GetUserFeed()
+        for album in albums_list.entry:
+            if album.title.text == self.name:
+                return album
+        return None
+
+    def rename(self, new_name):
+        # Update the name of the album only.
+        self.update()
+        self.g_obj.title.text = new_name
+        self.g_obj = self.picasa.Put(self.g_obj, self.g_obj.GetEditLink().href,
+                converter=gp.AlbumEntryFromString)
+        self.name = new_name
+        self.path = os.path.join(os.path.dirname(self.path), self.name)
+        for photo in self.photos:
+            self.photos[photo].rename_album(self)
+
+    def delete(self):
+        logging.debug("Remove %s..." % self.name)
+        self.update()
+        self.picasa.Delete(self.g_obj)
+
+class Photo():
+
+    def __init__(self, album, path):
+        # Setup the photo, if it doesn't exists, upload it
+        self.album = album
+        self.name = os.path.basename(path)
+        self.fd = open(path, 'rb')
+        logging.debug("Search %s/%s online..." % (self.album.name, self.name))
+        self.g_obj = self.is_online()
+        if self.g_obj is None:
+            logging.debug("Adding %s/%s..." % (self.album.name, self.name))
+            try:
+                self.album.picasa.InsertPhotoSimple(self.album.url, self.name,
+                        'Uploaded using Syncasa', self.fd)
+                self.update()
+            except GooglePhotosException as gpe:
+                logging.error(gpe)
+
+    def is_online(self):
+        # Check if it exists online, return the obj or None
+        photos = self.album.picasa.GetFeed(
+            '/data/feed/api/user/%s/albumid/%s?kind=photo' % (
+            "default", self.album.g_obj.gphoto_id.text))
+        for photo in photos.entry:
+            if photo.title.text == self.name:
+                return photo
+        return None
+
+    def update(self):
+        # Update the g_obj
+        self.g_obj = self.is_online()
+        if self.g_obj is None:
+            logging.error("Image not online.")
+
+    def delete(self):
+        # Delete photo from online
+        logging.debug("Remove %s/%s..." % (self.album.name, self.name))
+        self.update()
+        self.album.picasa.Delete(self.g_obj)
+        # Close file handler
+        self.fd.close()
+
+    def rename_album(self, new_album):
+        self.album = new_album
+        self.fd.close()
+        new_path = os.path.join(self.album.path, self.name)
+        logging.debug("New descriptor @ %s" % new_path)
+        self.fd = open(new_path, 'rb')
+
+    def rename(self, new_name):
+        # Rename the photo online
+        self.update()
+        self.name = new_name
+        self.g_obj.title.text = new_name
+        self.album.picasa.UpdatePhotoMetadata(self.g_obj)
+        self.fd.close()
+        new_path = os.path.join(self.album.path, self.name)
+        logging.debug("New descriptor @ %s" % new_path)
+        self.fd = open(new_path, 'rb')
+
+###############################################################################
+
+def main():
+    ''' launch everything '''
+
+    import argparse
+    import ConfigParser
+    config = ConfigParser.RawConfigParser()
+
+    parser = argparse.ArgumentParser(prog='syncasa')
+    parser.add_argument("folder",
+            help="Folder to watch, default is the current path.",
+            default=os.getcwd())
+    parser.add_argument("-c", "--config", dest="config", action="store",
+                      default="%s/.syncasa" % os.getenv("HOME"),
+                      help="Specify a config file to use, default will be in"
+                      " your home."
+                      )
+    parser.add_argument("-d", "--debug", dest="loglevel", action="store_const",
+                      const=logging.DEBUG, default=logging.INFO, help="Output"
+                      " debugging information")
+
+    options = parser.parse_args()
+    logging.basicConfig(level=options.loglevel, format='%(message)s')
+
+    if not os.path.exists(options.config):
+        import getpass
+        logging.info("Config file does not exists, let's create it :")
+        config.add_section('credential')
+        config.set('credential', 'username', raw_input("Username : "))
+        config.set('credential', 'password', getpass.getpass())
+        with open(options.config, 'w') as cred:
+            config.write(cred)
+        # Chmod it
+        os.chmod(options.config, 0600)
+
+    # Check the rights of the config file
+    import stat
+    if oct(stat.S_IMODE(os.stat(options.config).st_mode)) != "0600":
+        logging.error("%s must have 0600 rights, correct it." % options.config)
+        return 1
+
+    # Open config file and get username/password
+    config.read(options.config)
+    userid = config.get('credential', 'username')
+    pwd = config.get('credential', 'password')
+
+    picasa = Syncasa(options.folder)
+    if not picasa.login(userid, pwd):
+        logging.error("Error while authenticating.")
+        return 0
+
+    p.log.setLevel(logging.CRITICAL)
+    picasa.start()
+    return 0
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (KeyboardInterrupt):
+        pass
+
+
