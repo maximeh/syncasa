@@ -154,11 +154,11 @@ class Album():
         self.photos = {}
         for photo in os.listdir(path):
             file_path = os.path.join(path, photo)
-            logging.debug("Adding %s with name %s." % (file_path, photo))
             # Avoid directory and hidden file
             if not os.path.isfile(file_path) or photo[0] == '.':
                 continue
 
+            logging.debug("Adding %s with name %s." % (file_path, photo))
             # Check that it's an image
             file_mime_type = mimetypes.guess_type(photo)
             if file_mime_type[0] is None \
