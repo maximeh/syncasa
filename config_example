@@ -1,4 +1,5 @@
 [credential]
 username = account@gmail.com
 password = securepassword
-
+[blacklist]
+names = album1,album2,album with spaces,album3

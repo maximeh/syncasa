@@ -21,4 +21,10 @@ For the help, as usual :
 
     syncasa -h
 
+## blacklist
+
+There is a blacklist feature, if you have an album online and you don't want
+syncasa to touch it.
+Look at the config example to see how to do it.
+
 That's about it :)
