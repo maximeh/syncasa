@@ -17,7 +17,7 @@ import sys
 
 class Syncasa(ProcessEvent):
 
-    def __init__(self, path):
+    def __init__(self, path, blacklist):
         ProcessEvent.__init__(self)
         # Object needed for pyinotify
         self.wm = WatchManager()
@@ -31,11 +31,14 @@ class Syncasa(ProcessEvent):
         self.g_client = None
         self.path = path
         self.albums = {}
+        self.blacklist = blacklist.split(',')
 
     def start(self):
         # Delete album online but not locally
         o_albums = self.g_client.GetUserFeed()
         for o_album in o_albums.entry:
+            if o_album.title.text in self.blacklist:
+                continue
             o_album_path = os.path.join(self.path, o_album.title.text)
             if not os.path.exists(o_album_path):
                 logging.debug("%s does not exist locally, deleting.." % o_album_path)
@@ -288,6 +291,8 @@ def main():
         config.add_section('credential')
         config.set('credential', 'username', raw_input("Username : "))
         config.set('credential', 'password', getpass.getpass())
+        config.add_section('blacklist')
+        config.set('blacklist', 'names', raw_input("Album name to blacklist: "))
         with open(options.config, 'w') as cred:
             config.write(cred)
         # Chmod it
@@ -303,8 +308,9 @@ def main():
     config.read(options.config)
     userid = config.get('credential', 'username')
     pwd = config.get('credential', 'password')
+    blacklist = config.get('blacklist', 'names')
 
-    picasa = Syncasa(options.folder)
+    picasa = Syncasa(options.folder, blacklist)
     if not picasa.login(userid, pwd):
         logging.error("Error while authenticating.")
         return 0
