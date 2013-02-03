@@ -1,77 +1,65 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-
-import gdata.photos as gp
-from gdata.service import BadAuthentication
-from gdata.photos import service
-from gdata.photos.service import GooglePhotosException
-from atom.http import ProxyError
-
-import pyinotify as p
+from gdata.photos import service, AlbumEntryFromString
+from mimetypes import guess_type
 from pyinotify import WatchManager, Notifier, ProcessEvent
-
+from xml.dom import minidom
+import pyinotify as p
 import logging
-import mimetypes
 import os
 import sys
 
+G_CLIENT = None
+PATH = None
+
 class Syncasa(ProcessEvent):
 
-    def __init__(self, path, blacklist):
+    def __init__(self):
         ProcessEvent.__init__(self)
         # Object needed for pyinotify
         self.wm = WatchManager()
         mask = p.IN_CREATE | p.IN_CLOSE_WRITE | p.IN_DELETE | p.IN_DELETE_SELF
         mask |= p.IN_MOVED_TO | p.IN_MOVED_FROM | p.IN_MOVE_SELF
-        self.wdd = self.wm.add_watch(path, mask,
-            rec=True, auto_add=True)
-
+        self.wdd = self.wm.add_watch(PATH, mask, rec=True, auto_add=True)
         # Thread to treat the queue of event
         self.notifier = Notifier(self.wm, self)
-        self.g_client = None
-        self.path = path
         self.albums = {}
-        self.blacklist = blacklist.split(',')
 
-    def start(self):
-        # Delete album online but not locally
-        o_albums = self.g_client.GetUserFeed()
-        for o_album in o_albums.entry:
-            if o_album.title.text in self.blacklist:
+    def start(self, blacklist):
+
+        # Little hack as GetUserFeed was not normally prepared for this
+        fields = 'album&v=2.0&fields=entry(gphoto:id,title)'
+        o_albums = G_CLIENT.GetUserFeed(kind=fields).ToString()
+        #Delete album online but not locally
+        for title, id in parse_feed(o_albums):
+            if title in blacklist:
                 continue
-            o_album_path = os.path.join(self.path, o_album.title.text)
-            if not os.path.exists(o_album_path):
+            o_album_path = os.path.join(PATH, title)
+            if os.path.exists(o_album_path):
+                # The album exists also locally
+                self.albums[title] = Album(title, int(id))
+            else:
                 logging.debug("%s does not exist locally, deleting.." % o_album_path)
-                self.g_client.Delete(o_album)
+                url = '/data/entry/api/user/default/albumid/%s' % id
+                self.g_client.Delete(url)
 
-        # Create a dict of albums from the albums in the local folder
-        for album in os.listdir(self.path):
-            a_path = os.path.join(self.path, album)
+        # Find the album that exists locally but not yet online
+        for album in os.listdir(PATH):
+            a_path = os.path.join(PATH, album)
             if not os.path.isdir(a_path) or album[0] == '.':
                 continue
-            self.albums[album] = Album(self.g_client, a_path)
+            # The album does not exists online, we will create it
+            if album not in self.albums:
+                self.albums[album] = Album(album)
 
         # Loop forever and handle events.
-        # It seems the CTR+C event in taken care of by pyinotify
+        # It seems the CTR+C event is taken care of by pyinotify
         self.notifier.loop()
-
-    def login(self, user, pwd):
-        # log into the service
-        self.g_client = service.PhotosService()
-        self.g_client.email = user
-        self.g_client.password = pwd
-        self.g_client.source = 'syncasa'
-        try:
-            self.g_client.ProgrammaticLogin()
-        except (BadAuthentication, ProxyError) as err:
-            logging.error("Error while authenticating : %s", err)
-            return False
-        return True
 
     def process_IN_CREATE(self, event):
         if event.dir:
             # Create the album online
-            self.albums[event.name] = Album(self.g_client, event.pathname)
+            self.albums[event.name] = Album(event.name)
         return
 
     def process_IN_CLOSE_WRITE(self, event):
@@ -81,7 +69,7 @@ class Syncasa(ProcessEvent):
         # Create photo when created picture (in any way)
         album = event.path.split('/')[-1]
         self.albums[album].photos[event.name] = Photo(self.albums[album],
-                event.pathname)
+                event.name)
 
     def process_IN_DELETE(self, event):
         if event.dir:
@@ -126,145 +114,128 @@ class Syncasa(ProcessEvent):
             if event.dir:
                 self.process_IN_DELETE_SELF(event)
             else:
-                evet.path = tmp_path
+                event.path = tmp_path
                 self.process_IN_DELETE(event)
 
 class Album():
 
-    def __init__(self, picasa, path):
-        self.name = os.path.basename(path)
-        self.path = path
-        self.picasa = picasa
-        # Do we exists online ?
-        logging.debug("Search %s online..." % self.name)
-        self.g_obj = self.is_online()
-        if self.g_obj is None:
+    def __init__(self, name, album_id=None):
+        self.name = name
+        self.album_id = album_id
+        self.fields = 'kind=photo&v=2.0&fields=entry(gphoto:id,title)'
+        if self.album_id is None:
             logging.debug("Creating album %s online." % self.name)
-            self.g_obj = self.picasa.InsertAlbum(title=self.name,
+            g_obj = G_CLIENT.InsertAlbum(title=self.name,
                 summary="Sync of %s folder" % self.name, access='private')
-
-        self.url = '/data/feed/api/user/%s/albumid/%s' % (
-                        "default", self.g_obj.gphoto_id.text)
-
-        # Delete the picture online but not present locally
-        o_photos = self.picasa.GetFeed("%s?kind=photo" % self.url)
-        for o_photo in o_photos.entry:
-            o_photo_path = os.path.join(path, o_photo.title.text)
-            if not os.path.exists(o_photo_path):
-                logging.debug("%s does not exist locally, deleting.." % o_photo_path)
-                self.picasa.Delete(o_photo)
+            self.album_id = int(g_obj.gphoto_id.text)
 
         self.photos = {}
-        for photo in os.listdir(path):
-            file_path = os.path.join(path, photo)
+
+        o_photos_url = '/data/feed/api/user/default/albumid/%d?%s' % (
+                                        self.album_id, self.fields)
+
+        o_photos = G_CLIENT.GetFeed(o_photos_url).ToString()
+        # Delete the picture online but not present locally
+        for title, id in parse_feed(o_photos):
+            pic_path = os.path.join(PATH, self.name, title)
+            if not os.path.exists(pic_path):
+                logging.debug("%s does not exist locally, deleting." % pic_path)
+                url = '/data/feed/api/user/default/albumid/%d/photoid/%s' % (
+                        self.album_id, id)
+                G_CLIENT.Delete(url)
+            else:
+                # The photo exists locally
+                self.photos[title] = Photo(self, title, int(id))
+
+        for photo in os.listdir(PATH):
+            file_path = os.path.join(PATH, photo)
             # Avoid directory and hidden file
             if not os.path.isfile(file_path) or photo[0] == '.':
                 continue
 
             logging.debug("Adding %s with name %s." % (file_path, photo))
             # Check that it's an image
-            file_mime_type = mimetypes.guess_type(photo)
+            file_mime_type = guess_type(photo)
             if file_mime_type[0] is None \
                 or not file_mime_type[0].startswith("image/"):
                 continue
-            self.photos[photo] = Photo(self, file_path)
-
-    def update(self):
-        # Update the g_obj
-        self.g_obj = self.is_online()
-        if self.g_obj is None:
-            logging.error("Album not online.")
-
-    def is_online(self):
-        # check if the albums exists online
-        # return the obj or None
-        albums_list = self.picasa.GetUserFeed()
-        for album in albums_list.entry:
-            if album.title.text == self.name:
-                return album
-        return None
+            # If the photo is not online, we must create it
+            if photo not in self.photos:
+                self.photos[photo] = Photo(self, photo)
 
     def rename(self, new_name):
-        # Update the name of the album only.
-        self.update()
-        self.g_obj.title.text = new_name
-        self.g_obj = self.picasa.Put(self.g_obj, self.g_obj.GetEditLink().href,
-                converter=gp.AlbumEntryFromString)
+        url = '/data/entry/api/user/default/albumid/%d' % self.album_id
+        g_obj = G_CLIENT.GetFeed(url)
+        g_obj.title.text = new_name
+        g_obj = G_CLIENT.Put(g_obj, url, converter=AlbumEntryFromString)
         self.name = new_name
-        self.path = os.path.join(os.path.dirname(self.path), self.name)
-        for photo in self.photos:
-            self.photos[photo].rename_album(self)
 
     def delete(self):
         logging.debug("Remove %s..." % self.name)
-        self.update()
-        self.picasa.Delete(self.g_obj)
+        url = '/data/entry/api/user/default/albumid/%d' % self.album_id
+        G_CLIENT.Delete(url)
 
 class Photo():
 
-    def __init__(self, album, path):
+    def __init__(self, album, name, photo_id=None):
         # Setup the photo, if it doesn't exists, upload it
         self.album = album
-        self.name = os.path.basename(path)
-        self.fd = open(path, 'rb')
-        logging.debug("Search %s/%s online..." % (self.album.name, self.name))
-        self.g_obj = self.is_online()
-        if self.g_obj is None:
+        self.name = name
+        self.photo_id = photo_id
+        if self.photo_id is None:
+            pic_path = os.path.join(PATH, self.album.name, name)
+            fd = open(pic_path, 'rb')
             logging.debug("Adding %s/%s..." % (self.album.name, self.name))
+            url = "/data/feed/api/user/default/albumid/%s" % self.album.album_id
             try:
-                self.album.picasa.InsertPhotoSimple(self.album.url, self.name,
-                        'Uploaded using Syncasa', self.fd)
-                self.update()
-            except GooglePhotosException as gpe:
+                g_obj = G_CLIENT.InsertPhotoSimple(url, self.name,
+                        'Uploaded using Syncasa', fd)
+                self.photo_id = int(g_obj.gphoto_id.text)
+            except Exception as gpe:
                 logging.error(gpe)
-
-    def is_online(self):
-        # Check if it exists online, return the obj or None
-        photos = self.album.picasa.GetFeed(
-            '/data/feed/api/user/%s/albumid/%s?kind=photo' % (
-            "default", self.album.g_obj.gphoto_id.text))
-        for photo in photos.entry:
-            if photo.title.text == self.name:
-                return photo
-        return None
-
-    def update(self):
-        # Update the g_obj
-        self.g_obj = self.is_online()
-        if self.g_obj is None:
-            logging.error("Image not online.")
+                self.photo_id = None
+            fd.close()
 
     def delete(self):
         # Delete photo from online
         logging.debug("Remove %s/%s..." % (self.album.name, self.name))
-        self.update()
-        self.album.picasa.Delete(self.g_obj)
-        # Close file handler
-        self.fd.close()
-
-    def rename_album(self, new_album):
-        self.album = new_album
-        self.fd.close()
-        new_path = os.path.join(self.album.path, self.name)
-        logging.debug("New descriptor @ %s" % new_path)
-        self.fd = open(new_path, 'rb')
+        url = "/data/feed/api/user/default/albumid/%d/photoid/%d" % (
+                self.album.album_id, self.photo_id)
+        G_CLIENT.Delete(url)
 
     def rename(self, new_name):
-        # Rename the photo online
-        self.update()
+        url = "/data/feed/api/user/default/albumid/%d/photoid/%d" % (
+                self.album.album_id, self.photo_id)
+        g_obj = G_CLIENT.GetFeed(url)
+        g_obj.title.text = new_name
+        G_CLIENT.UpdatePhotoMetadata(g_obj)
         self.name = new_name
-        self.g_obj.title.text = new_name
-        self.album.picasa.UpdatePhotoMetadata(self.g_obj)
-        self.fd.close()
-        new_path = os.path.join(self.album.path, self.name)
-        logging.debug("New descriptor @ %s" % new_path)
-        self.fd = open(new_path, 'rb')
 
 ###############################################################################
+def login(user, pwd):
+    # log into the service
+    tmp_client = service.PhotosService()
+    tmp_client.email = user
+    tmp_client.password = pwd
+    tmp_client.source = 'syncasa'
+    try:
+        tmp_client.ProgrammaticLogin()
+    except Exception as err:
+        logging.error("Error while authenticating : %s", err)
+        return None
+    return tmp_client
+
+def parse_feed(feed):
+    data = minidom.parseString(feed)
+    entries = data.getElementsByTagName('ns0:entry')
+    for entry in entries:
+        title = entry.getElementsByTagName('ns0:title')[0].firstChild.data
+        id = entry.getElementsByTagName('ns1:id')[0].firstChild.data
+        yield title, id
 
 def main():
     ''' launch everything '''
-
+    global G_CLIENT, PATH
     import argparse
     import ConfigParser
     config = ConfigParser.RawConfigParser()
@@ -283,11 +254,13 @@ def main():
                       " debugging information")
 
     options = parser.parse_args()
+    PATH = options.folder
     logging.basicConfig(level=options.loglevel, format='%(message)s')
+    p.log.setLevel(logging.CRITICAL)
 
     if not os.path.exists(options.config):
         import getpass
-        logging.info("Config file does not exists, let's create it :")
+        # logging.info("Config file does not exists, let's create it :")
         config.add_section('credential')
         config.set('credential', 'username', raw_input("Username : "))
         config.set('credential', 'password', getpass.getpass())
@@ -308,15 +281,15 @@ def main():
     config.read(options.config)
     userid = config.get('credential', 'username')
     pwd = config.get('credential', 'password')
-    blacklist = config.get('blacklist', 'names')
+    blacklist = config.get('blacklist', 'names').split(',')
 
-    picasa = Syncasa(options.folder, blacklist)
-    if not picasa.login(userid, pwd):
+    G_CLIENT = login(userid, pwd)
+    if G_CLIENT is None:
         logging.error("Error while authenticating.")
         return 0
 
-    p.log.setLevel(logging.CRITICAL)
-    picasa.start()
+    picasa = Syncasa()
+    picasa.start(blacklist)
     return 0
 
 if __name__ == '__main__':
@@ -324,5 +297,4 @@ if __name__ == '__main__':
         sys.exit(main())
     except (KeyboardInterrupt):
         pass
-
 

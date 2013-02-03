@@ -2,6 +2,12 @@
 ### Synchronise your Picasa folder with your machine
 
 Keep your account in sync with your machine, without thinking about it.
+It's just a little hack I use to publish albums easily, so don't expect much
+from it.
+
+The sync is done local -> google, and local is considered to be the truth.
+Nothing that happens online is taken into account, also if you change an album
+name online, some weird stuff may happens.
 
 ## install
 
