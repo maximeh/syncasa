@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-from gdata.photos import service, AlbumEntryFromString
+from gdata.photos import service, AlbumEntryFromString, PhotoEntryFromString
 from mimetypes import guess_type
 from pyinotify import WatchManager, Notifier, ProcessEvent
 from xml.dom import minidom
@@ -28,7 +28,7 @@ class Syncasa(ProcessEvent):
     def start(self, blacklist):
 
         # Little hack as GetUserFeed was not normally prepared for this
-        fields = 'album&v=2.0&fields=entry(gphoto:id,title)'
+        fields = 'album&v=4.0&fields=entry(gphoto:id,title)'
         o_albums = G_CLIENT.GetUserFeed(kind=fields).ToString()
         #Delete album online but not locally
         for title, id in parse_feed(o_albums):
@@ -37,11 +37,12 @@ class Syncasa(ProcessEvent):
             o_album_path = os.path.join(PATH, title)
             if os.path.exists(o_album_path):
                 # The album exists also locally
+                logging.debug("%s exists both ways, syncing...", title)
                 self.albums[title] = Album(title, int(id))
             else:
                 logging.debug("%s does not exist locally, deleting.." % o_album_path)
                 url = '/data/entry/api/user/default/albumid/%s' % id
-                self.g_client.Delete(url)
+                G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
         # Find the album that exists locally but not yet online
         for album in os.listdir(PATH):
@@ -68,6 +69,8 @@ class Syncasa(ProcessEvent):
             return
         # Create photo when created picture (in any way)
         album = event.path.split('/')[-1]
+        if album not in self.albums:
+            return
         self.albums[album].photos[event.name] = Photo(self.albums[album],
                 event.name)
 
@@ -75,11 +78,15 @@ class Syncasa(ProcessEvent):
         if event.dir:
             return
         album = event.path.split('/')[-1]
+        if album not in self.albums:
+            return
         self.albums[album].photos[event.name].delete()
         del self.albums[album].photos[event.name]
 
     def process_IN_DELETE_SELF(self, event):
         if not event.dir:
+            return
+        if event.name not in self.albums:
             return
         self.albums[event.name].delete()
         del self.albums[event.name]
@@ -108,21 +115,22 @@ class Syncasa(ProcessEvent):
     def process_IN_MOVE_SELF(self, event):
         # Moving from a watched directory to somewhere externals
         # Treat as a delete
-        if "-unknown-path" in event.path:
-            tmp_path = event.path.split('-unknown-path')[0]
-            event.name = tmp_path.split('/')[-1]
-            if event.dir:
-                self.process_IN_DELETE_SELF(event)
-            else:
-                event.path = tmp_path
-                self.process_IN_DELETE(event)
+        if "-unknown-path" not in event.path:
+            return
+        tmp_path = event.path.split('-unknown-path')[0]
+        event.name = tmp_path.split('/')[-1]
+        if event.dir:
+            self.process_IN_DELETE_SELF(event)
+        else:
+            event.path = tmp_path
+            self.process_IN_DELETE(event)
 
 class Album():
 
     def __init__(self, name, album_id=None):
         self.name = name
         self.album_id = album_id
-        self.fields = 'kind=photo&v=2.0&fields=entry(gphoto:id,title)'
+        self.fields = 'kind=photo&v=4.0&fields=entry(gphoto:id,title)'
         if self.album_id is None:
             logging.debug("Creating album %s online." % self.name)
             g_obj = G_CLIENT.InsertAlbum(title=self.name,
@@ -140,20 +148,19 @@ class Album():
             pic_path = os.path.join(PATH, self.name, title)
             if not os.path.exists(pic_path):
                 logging.debug("%s does not exist locally, deleting." % pic_path)
-                url = '/data/feed/api/user/default/albumid/%d/photoid/%s' % (
+                url = '/data/entry/api/user/default/albumid/%d/photoid/%s' % (
                         self.album_id, id)
-                G_CLIENT.Delete(url)
+                G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
             else:
                 # The photo exists locally
                 self.photos[title] = Photo(self, title, int(id))
 
-        for photo in os.listdir(PATH):
-            file_path = os.path.join(PATH, photo)
+        for photo in os.listdir(os.path.join(PATH, self.name)):
+            file_path = os.path.join(PATH, self.name, photo)
             # Avoid directory and hidden file
             if not os.path.isfile(file_path) or photo[0] == '.':
                 continue
 
-            logging.debug("Adding %s with name %s." % (file_path, photo))
             # Check that it's an image
             file_mime_type = guess_type(photo)
             if file_mime_type[0] is None \
@@ -164,8 +171,8 @@ class Album():
                 self.photos[photo] = Photo(self, photo)
 
     def rename(self, new_name):
-        url = '/data/entry/api/user/default/albumid/%d' % self.album_id
-        g_obj = G_CLIENT.GetFeed(url)
+        url = '/data/entry/api/user/default/albumid/%d?v=4.0' % self.album_id
+        g_obj = G_CLIENT.Get(url, converter=AlbumEntryFromString)
         g_obj.title.text = new_name
         g_obj = G_CLIENT.Put(g_obj, url, converter=AlbumEntryFromString)
         self.name = new_name
@@ -173,7 +180,7 @@ class Album():
     def delete(self):
         logging.debug("Remove %s..." % self.name)
         url = '/data/entry/api/user/default/albumid/%d' % self.album_id
-        G_CLIENT.Delete(url)
+        G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
 class Photo():
 
@@ -201,14 +208,14 @@ class Photo():
         logging.debug("Remove %s/%s..." % (self.album.name, self.name))
         url = "/data/feed/api/user/default/albumid/%d/photoid/%d" % (
                 self.album.album_id, self.photo_id)
-        G_CLIENT.Delete(url)
+        G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
     def rename(self, new_name):
-        url = "/data/feed/api/user/default/albumid/%d/photoid/%d" % (
+        url = '/data/entry/api/user/default/albumid/%d/photoid/%d?v=4.0' % (
                 self.album.album_id, self.photo_id)
-        g_obj = G_CLIENT.GetFeed(url)
+        g_obj = G_CLIENT.Get(url, converter=PhotoEntryFromString)
         g_obj.title.text = new_name
-        G_CLIENT.UpdatePhotoMetadata(g_obj)
+        g_obj = G_CLIENT.Put(g_obj, url, converter=PhotoEntryFromString)
         self.name = new_name
 
 ###############################################################################
