@@ -5,7 +5,7 @@ from mimetypes import guess_type
 from pyinotify import WatchManager, Notifier, ProcessEvent
 from xml.dom import minidom
 import pyinotify as p
-import logging
+import logging as l
 import os
 import sys
 
@@ -31,17 +31,17 @@ class Syncasa(ProcessEvent):
         fields = 'album&v=4.0&fields=entry(gphoto:id,title)'
         o_albums = G_CLIENT.GetUserFeed(kind=fields).ToString()
         #Delete album online but not locally
-        for title, id in parse_feed(o_albums):
+        for title, album_id in parse_feed(o_albums):
             if title in blacklist:
                 continue
             o_album_path = os.path.join(PATH, title)
             if os.path.exists(o_album_path):
                 # The album exists also locally
-                logging.debug("%s exists both ways, syncing...", title)
-                self.albums[title] = Album(title, int(id))
+                l.debug("%s exists both ways, syncing...", title)
+                self.albums[title] = Album(title, int(album_id))
             else:
-                logging.debug("%s does not exist locally, deleting.." % o_album_path)
-                url = '/data/entry/api/user/default/albumid/%s' % id
+                l.debug("%s does not exist locally, deleting..", o_album_path)
+                url = '/data/entry/api/user/default/albumid/%s' % album_id
                 G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
         # Find the album that exists locally but not yet online
@@ -103,7 +103,7 @@ class Syncasa(ProcessEvent):
                 self.process_IN_CLOSE_WRITE(event)
             return
         old_name = event.src_pathname.split('/')[-1]
-        logging.debug("Rename %s -> %s" % (old_name, event.name))
+        l.debug("Rename %s -> %s", old_name, event.name)
         if event.dir:
             self.albums[old_name].rename(event.name)
             self.albums[event.name] = self.albums.pop(old_name)
@@ -132,7 +132,7 @@ class Album():
         self.album_id = album_id
         self.fields = 'kind=photo&v=4.0&fields=entry(gphoto:id,title)'
         if self.album_id is None:
-            logging.debug("Creating album %s online." % self.name)
+            l.debug("Creating album %s online.", self.name)
             g_obj = G_CLIENT.InsertAlbum(title=self.name,
                 summary="Sync of %s folder" % self.name, access='private')
             self.album_id = int(g_obj.gphoto_id.text)
@@ -147,7 +147,7 @@ class Album():
         for title, id in parse_feed(o_photos):
             pic_path = os.path.join(PATH, self.name, title)
             if not os.path.exists(pic_path):
-                logging.debug("%s does not exist locally, deleting." % pic_path)
+                l.debug("%s does not exist locally, deleting.", pic_path)
                 url = '/data/entry/api/user/default/albumid/%d/photoid/%s' % (
                         self.album_id, id)
                 G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
@@ -178,7 +178,7 @@ class Album():
         self.name = new_name
 
     def delete(self):
-        logging.debug("Remove %s..." % self.name)
+        l.debug("Remove %s...", self.name)
         url = '/data/entry/api/user/default/albumid/%d' % self.album_id
         G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
@@ -192,20 +192,20 @@ class Photo():
         if self.photo_id is None:
             pic_path = os.path.join(PATH, self.album.name, name)
             fd = open(pic_path, 'rb')
-            logging.debug("Adding %s/%s..." % (self.album.name, self.name))
+            l.debug("Adding %s/%s...", self.album.name, self.name)
             url = "/data/feed/api/user/default/albumid/%s" % self.album.album_id
             try:
                 g_obj = G_CLIENT.InsertPhotoSimple(url, self.name,
                         'Uploaded using Syncasa', fd)
                 self.photo_id = int(g_obj.gphoto_id.text)
             except Exception as gpe:
-                logging.error(gpe)
+                l.error(gpe)
                 self.photo_id = None
             fd.close()
 
     def delete(self):
         # Delete photo from online
-        logging.debug("Remove %s/%s..." % (self.album.name, self.name))
+        l.debug("Remove %s/%s...", self.album.name, self.name)
         url = "/data/feed/api/user/default/albumid/%d/photoid/%d" % (
                 self.album.album_id, self.photo_id)
         G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
@@ -228,7 +228,7 @@ def login(user, pwd):
     try:
         tmp_client.ProgrammaticLogin()
     except Exception as err:
-        logging.error("Error while authenticating : %s", err)
+        l.error("Error while authenticating : %s", err)
         return None
     return tmp_client
 
@@ -257,13 +257,13 @@ def main():
                       " your home."
                       )
     parser.add_argument("-d", "--debug", dest="loglevel", action="store_const",
-                      const=logging.DEBUG, default=logging.INFO, help="Output"
+                      const=l.DEBUG, default=l.INFO, help="Output"
                       " debugging information")
 
     options = parser.parse_args()
     PATH = options.folder
-    logging.basicConfig(level=options.loglevel, format='%(message)s')
-    p.log.setLevel(logging.CRITICAL)
+    l.basicConfig(level=options.loglevel, format='%(message)s')
+    p.log.setLevel(l.CRITICAL)
 
     if not os.path.exists(options.config):
         import getpass
@@ -281,7 +281,7 @@ def main():
     # Check the rights of the config file
     import stat
     if oct(stat.S_IMODE(os.stat(options.config).st_mode)) != "0600":
-        logging.error("%s must have 0600 rights, correct it." % options.config)
+        l.error("%s must have 0600 rights, correct it.", options.config)
         return 1
 
     # Open config file and get username/password
@@ -292,7 +292,7 @@ def main():
 
     G_CLIENT = login(userid, pwd)
     if G_CLIENT is None:
-        logging.error("Error while authenticating.")
+        l.error("Error while authenticating.")
         return 0
 
     picasa = Syncasa()
