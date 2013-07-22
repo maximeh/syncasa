@@ -15,6 +15,8 @@ PATH = None
 
 class Syncasa(ProcessEvent):
 
+    __slots__ = ('wm', 'wdd', 'notifier', 'albums', 'push')
+
     def __init__(self, push=False):
         ProcessEvent.__init__(self)
         # Object needed for pyinotify
@@ -26,6 +28,9 @@ class Syncasa(ProcessEvent):
         self.notifier = Notifier(self.wm, self)
         self.albums = {}
         self.push = push
+
+    def __getattr__(self, name):
+        return None
 
     def start(self, blacklist):
 
@@ -141,6 +146,9 @@ class Syncasa(ProcessEvent):
 
 class Album():
 
+
+    __slots__ = ('name', 'album_id', 'fields', 'photos')
+
     def __init__(self, name, album_id=None):
         self.name = name
         self.album_id = album_id
@@ -184,6 +192,9 @@ class Album():
             if photo not in self.photos:
                 self.photos[photo] = Photo(self, photo)
 
+    def __getattr__(self, name):
+        return None
+
     def rename(self, new_name):
         url = '/data/entry/api/user/default/albumid/%d?v=4.0' % self.album_id
         g_obj = G_CLIENT.Get(url, converter=AlbumEntryFromString)
@@ -197,6 +208,8 @@ class Album():
         G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
 
 class Photo():
+
+    __slots__ = ('album', 'name', 'photo_id')
 
     def __init__(self, album, name, photo_id=None):
         # Setup the photo, if it doesn't exists, upload it
@@ -216,6 +229,9 @@ class Photo():
                 l.error(gpe)
                 self.photo_id = None
             fd.close()
+
+    def __getattr__(self, name):
+        return None
 
     def delete(self):
         # Delete photo from online
@@ -285,7 +301,6 @@ def main():
 
     if not os.path.exists(options.config):
         import getpass
-        # logging.info("Config file does not exists, let's create it :")
         config.add_section('credential')
         config.set('credential', 'username', raw_input("Username : "))
         config.set('credential', 'password', getpass.getpass())
