@@ -7,6 +7,7 @@ from xml.dom import minidom
 import pyinotify as p
 import logging as l
 import os
+import shutil
 import sys
 
 G_CLIENT = None
@@ -14,7 +15,7 @@ PATH = None
 
 class Syncasa(ProcessEvent):
 
-    def __init__(self):
+    def __init__(self, push=False):
         ProcessEvent.__init__(self)
         # Object needed for pyinotify
         self.wm = WatchManager()
@@ -24,6 +25,7 @@ class Syncasa(ProcessEvent):
         # Thread to treat the queue of event
         self.notifier = Notifier(self.wm, self)
         self.albums = {}
+        self.push = push
 
     def start(self, blacklist):
 
@@ -39,7 +41,10 @@ class Syncasa(ProcessEvent):
                 # The album exists also locally
                 l.debug("%s exists both ways, syncing...", title)
                 self.albums[title] = Album(title, int(album_id))
-            else:
+                if self.push:
+                    del self.albums[title]
+                    shutil.rmtree(o_album_path)
+            elif not self.push:
                 l.debug("%s does not exist locally, deleting..", o_album_path)
                 url = '/data/entry/api/user/default/albumid/%s' % album_id
                 G_CLIENT.Delete(url, extra_headers={'If-Match':'*'})
@@ -52,6 +57,9 @@ class Syncasa(ProcessEvent):
             # The album does not exists online, we will create it
             if album not in self.albums:
                 self.albums[album] = Album(album)
+                if self.push:
+                    del self.albums[album]
+                    shutil.rmtree(a_path)
 
         # Loop forever and handle events.
         # It seems the CTR+C event is taken care of by pyinotify
@@ -61,10 +69,14 @@ class Syncasa(ProcessEvent):
         if event.dir:
             # Create the album online
             self.albums[event.name] = Album(event.name)
+            if self.push:
+                del self.albums[event.name]
+                shutil.rmtree(os.path.join(PATH, event.name))
+
         return
 
     def process_IN_CLOSE_WRITE(self, event):
-        if event.dir:
+        if event.dir or self.push:
             # We are not interested in theses events
             return
         # Create photo when created picture (in any way)
@@ -75,7 +87,7 @@ class Syncasa(ProcessEvent):
                 event.name)
 
     def process_IN_DELETE(self, event):
-        if event.dir:
+        if event.dir or self.push:
             return
         album = event.path.split('/')[-1]
         if album not in self.albums:
@@ -84,7 +96,7 @@ class Syncasa(ProcessEvent):
         del self.albums[album].photos[event.name]
 
     def process_IN_DELETE_SELF(self, event):
-        if not event.dir:
+        if not event.dir or self.push:
             return
         if event.name not in self.albums:
             return
@@ -102,6 +114,8 @@ class Syncasa(ProcessEvent):
             else:
                 self.process_IN_CLOSE_WRITE(event)
             return
+        if self.push:
+            return
         old_name = event.src_pathname.split('/')[-1]
         l.debug("Rename %s -> %s", old_name, event.name)
         if event.dir:
@@ -115,7 +129,7 @@ class Syncasa(ProcessEvent):
     def process_IN_MOVE_SELF(self, event):
         # Moving from a watched directory to somewhere externals
         # Treat as a delete
-        if "-unknown-path" not in event.path:
+        if "-unknown-path" not in event.path or self.push:
             return
         tmp_path = event.path.split('-unknown-path')[0]
         event.name = tmp_path.split('/')[-1]
@@ -256,6 +270,10 @@ def main():
                       help="Specify a config file to use, default will be in"
                       " your home."
                       )
+    parser.add_argument("-p", "--push", dest="push", action="store_const",
+                      const=True, default=False, help="Push files to G+ instead"
+                      " of keeping them in sync. This will delete local files"
+                      "once they are uploaded")
     parser.add_argument("-d", "--debug", dest="loglevel", action="store_const",
                       const=l.DEBUG, default=l.INFO, help="Output"
                       " debugging information")
@@ -295,7 +313,7 @@ def main():
         l.error("Error while authenticating.")
         return 0
 
-    picasa = Syncasa()
+    picasa = Syncasa(push=options.push)
     picasa.start(blacklist)
     return 0
 
